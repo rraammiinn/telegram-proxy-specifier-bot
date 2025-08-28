@@ -180,6 +180,72 @@ WantedBy=multi-user.target"""
             logger.error(f"Error writing service file: {e}")
             return False
     
+    async def _wait_for_service_status(self, expected_status, max_attempts=15, delay=0.5):
+        """Wait for service to reach expected status with polling"""
+        for attempt in range(max_attempts):
+            try:
+                result = subprocess.run(['systemctl', 'is-active', 'MTProxy'], 
+                                      capture_output=True, text=True, timeout=5)
+                current_status = result.stdout.strip()
+                
+                if current_status == expected_status:
+                    logger.info(f"Service reached {expected_status} status after {attempt + 1} attempts")
+                    return True
+                    
+                logger.debug(f"Attempt {attempt + 1}: Service status is '{current_status}', waiting for '{expected_status}'")
+                await asyncio.sleep(delay)
+                
+            except Exception as e:
+                logger.warning(f"Error checking service status on attempt {attempt + 1}: {e}")
+                await asyncio.sleep(delay)
+        
+        logger.error(f"Service failed to reach {expected_status} status after {max_attempts} attempts")
+        return False
+    
+    async def _restart_mtproxy_service(self):
+        """Restart MTProxy service with pid_max workaround for MTProxy bug"""
+        try:
+            # Stop service
+            logger.info("Stopping MTProxy service...")
+            subprocess.run(['systemctl', 'stop', 'MTProxy'], check=False)
+            
+            # Wait for service to actually stop
+            if not await self._wait_for_service_status('inactive'):
+                logger.warning("Service didn't stop cleanly, proceeding anyway")
+            
+            # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
+            subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+            logger.info("Set pid_max to 32768 before MTProxy start")
+            
+            # Reload and start
+            logger.info("Starting MTProxy service...")
+            subprocess.run(['systemctl', 'daemon-reload'], check=True)
+            subprocess.run(['systemctl', 'start', 'MTProxy'], check=True)
+            
+            # Wait for service to actually start and become active
+            if not await self._wait_for_service_status('active'):
+                logger.error("Service failed to start properly")
+                return False
+            
+            # Restore pid_max to default value (4194304)
+            subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+            logger.info("Restored pid_max to default value 4194304")
+            
+            # Update restart timestamp
+            self.last_mtproxy_restart = time.time()
+            logger.info("✅ MTProxy service restarted successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Error restarting MTProxy: {e}")
+            # Try to restore pid_max even if restart failed
+            try:
+                subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+                logger.info("Restored pid_max to default after error")
+            except:
+                logger.error("Failed to restore pid_max after error")
+            return False
+    
     async def add_secret(self, secret):
         """Add secret to MTProxy with rate limiting and error handling"""
         try:
@@ -201,30 +267,15 @@ WantedBy=multi-user.target"""
                 if secret not in config['secrets']:
                     config['secrets'].append(secret)
                     
-                    # Stop service
-                    subprocess.run(['systemctl', 'stop', 'MTProxy'], check=False)
-                    
                     # Write new service file
                     if not self._write_service_file(config):
                         self.stats['errors'] += 1
                         return False
                     
-                    # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
-                    subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
-                    logger.info("Set pid_max to 32768 before MTProxy start")
-                    
-                    # Reload and start
-                    subprocess.run(['systemctl', 'daemon-reload'], check=True)
-                    result = subprocess.run(['systemctl', 'start', 'MTProxy'], check=True)
-                    
-                    # Wait for service to start properly
-                    await asyncio.sleep(2)
-                    
-                    # Restore pid_max to default value (4194304)
-                    subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
-                    logger.info("Restored pid_max to default value 4194304")
-                    
-                    self.last_mtproxy_restart = time.time()
+                    # Restart MTProxy with pid_max workaround
+                    if not await self._restart_mtproxy_service():
+                        self.stats['errors'] += 1
+                        return False
                     self.stats['proxies_created'] += 1
                     logger.info(f"✅ Added secret: {secret[:8]}...")
                     return True
@@ -256,30 +307,15 @@ WantedBy=multi-user.target"""
                 if secret in config['secrets']:
                     config['secrets'].remove(secret)
                     
-                    # Stop service
-                    subprocess.run(['systemctl', 'stop', 'MTProxy'], check=False)
-                    
                     # Write new service file
                     if not self._write_service_file(config):
                         self.stats['errors'] += 1
                         return False
                     
-                    # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
-                    subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
-                    logger.info("Set pid_max to 32768 before MTProxy start")
-                    
-                    # Reload and start
-                    subprocess.run(['systemctl', 'daemon-reload'], check=True)
-                    subprocess.run(['systemctl', 'start', 'MTProxy'], check=True)
-                    
-                    # Wait for service to start properly
-                    await asyncio.sleep(2)
-                    
-                    # Restore pid_max to default value (4194304)
-                    subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
-                    logger.info("Restored pid_max to default value 4194304")
-                    
-                    self.last_mtproxy_restart = time.time()
+                    # Restart MTProxy with pid_max workaround
+                    if not await self._restart_mtproxy_service():
+                        self.stats['errors'] += 1
+                        return False
                     self.stats['proxies_removed'] += 1
                     logger.info(f"✅ Removed secret: {secret[:8]}...")
                     return True
@@ -1281,48 +1317,32 @@ WantedBy=multi-user.target"""
             # Send initial message
             status_msg = await update.message.reply_text(self.t('admin_restart_proxy_progress'))
             
-            # Stop MTProxy service
-            stop_result = subprocess.run(['systemctl', 'stop', 'MTProxy'], 
-                                       capture_output=True, text=True, timeout=30)
-            
-            # Wait a moment
-            await asyncio.sleep(2)
-            
-            # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
-            subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
-            logger.info("Set pid_max to 32768 before MTProxy restart")
-            
-            # Start MTProxy service
-            start_result = subprocess.run(['systemctl', 'start', 'MTProxy'], 
-                                        capture_output=True, text=True, timeout=30)
-            
-            # Wait for service to start properly
-            await asyncio.sleep(3)
-            
-            # Restore pid_max to default value (4194304)
-            subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
-            logger.info("Restored pid_max to default value 4194304")
-            
-            # Check service status
-            status_result = subprocess.run(['systemctl', 'is-active', 'MTProxy'], 
-                                         capture_output=True, text=True, timeout=10)
-            
-            if status_result.returncode == 0 and status_result.stdout.strip() == 'active':
-                await status_msg.edit_text(
-                    self.t('admin_restart_proxy_success', 
-                           username=update.effective_user.username or 'Unknown',
-                           time=time.strftime('%Y-%m-%d %H:%M:%S')),
-                    parse_mode='Markdown'
-                )
-                logger.info(f"✅ MTProxy restarted successfully by admin {user_id}")
-                self.last_mtproxy_restart = time.time()
+            # Restart MTProxy with pid_max workaround
+            if await self._restart_mtproxy_service():
+                # Check service status
+                status_result = subprocess.run(['systemctl', 'is-active', 'MTProxy'], 
+                                             capture_output=True, text=True, timeout=10)
+                
+                if status_result.returncode == 0 and status_result.stdout.strip() == 'active':
+                    await status_msg.edit_text(
+                        self.t('admin_restart_proxy_success', 
+                               username=update.effective_user.username or 'Unknown',
+                               time=time.strftime('%Y-%m-%d %H:%M:%S')),
+                        parse_mode='Markdown'
+                    )
+                    logger.info(f"✅ MTProxy restarted successfully by admin {user_id}")
+                else:
+                    await status_msg.edit_text(
+                        self.t('admin_restart_proxy_failed', error="Service not active after restart"),
+                        parse_mode='Markdown'
+                    )
+                    logger.error(f"❌ MTProxy restart failed by admin {user_id}: Service not active")
             else:
-                error_info = f"Stop: {stop_result.stderr}\nStart: {start_result.stderr}" if (stop_result.stderr or start_result.stderr) else "Unknown error"
                 await status_msg.edit_text(
-                    self.t('admin_restart_proxy_failed', error=error_info[:200]),
+                    self.t('admin_restart_proxy_failed', error="Restart function failed"),
                     parse_mode='Markdown'
                 )
-                logger.error(f"❌ MTProxy restart failed by admin {user_id}: {error_info}")
+                logger.error(f"❌ MTProxy restart failed by admin {user_id}: Restart function failed")
                 
         except subprocess.TimeoutExpired:
             await status_msg.edit_text(
