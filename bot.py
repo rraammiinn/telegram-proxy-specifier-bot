@@ -209,9 +209,20 @@ WantedBy=multi-user.target"""
                         self.stats['errors'] += 1
                         return False
                     
+                    # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
+                    subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+                    logger.info("Set pid_max to 32768 before MTProxy start")
+                    
                     # Reload and start
                     subprocess.run(['systemctl', 'daemon-reload'], check=True)
                     result = subprocess.run(['systemctl', 'start', 'MTProxy'], check=True)
+                    
+                    # Wait for service to start properly
+                    await asyncio.sleep(2)
+                    
+                    # Restore pid_max to default value (4194304)
+                    subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+                    logger.info("Restored pid_max to default value 4194304")
                     
                     self.last_mtproxy_restart = time.time()
                     self.stats['proxies_created'] += 1
@@ -253,9 +264,20 @@ WantedBy=multi-user.target"""
                         self.stats['errors'] += 1
                         return False
                     
+                    # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
+                    subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+                    logger.info("Set pid_max to 32768 before MTProxy start")
+                    
                     # Reload and start
                     subprocess.run(['systemctl', 'daemon-reload'], check=True)
                     subprocess.run(['systemctl', 'start', 'MTProxy'], check=True)
+                    
+                    # Wait for service to start properly
+                    await asyncio.sleep(2)
+                    
+                    # Restore pid_max to default value (4194304)
+                    subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+                    logger.info("Restored pid_max to default value 4194304")
                     
                     self.last_mtproxy_restart = time.time()
                     self.stats['proxies_removed'] += 1
@@ -1266,9 +1288,20 @@ WantedBy=multi-user.target"""
             # Wait a moment
             await asyncio.sleep(2)
             
+            # Set pid_max to 32768 before starting MTProxy (workaround for MTProxy bug)
+            subprocess.run(['echo', '32768'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+            logger.info("Set pid_max to 32768 before MTProxy restart")
+            
             # Start MTProxy service
             start_result = subprocess.run(['systemctl', 'start', 'MTProxy'], 
                                         capture_output=True, text=True, timeout=30)
+            
+            # Wait for service to start properly
+            await asyncio.sleep(3)
+            
+            # Restore pid_max to default value (4194304)
+            subprocess.run(['echo', '4194304'], stdout=open('/proc/sys/kernel/pid_max', 'w'), check=True)
+            logger.info("Restored pid_max to default value 4194304")
             
             # Check service status
             status_result = subprocess.run(['systemctl', 'is-active', 'MTProxy'], 
